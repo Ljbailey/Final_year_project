@@ -1,0 +1,2647 @@
+---
+title: "analysis"
+output: html_document
+---
+
+# Analysis of Final Year Project Data
+
+## Data Preperation 
+
+```{r load packages, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Loading packages
+
+library(tidyverse)
+library(here)
+library(aplpack)
+library(interactions)
+library(car)
+library(lmtest)
+library(stats)
+
+```
+
+
+```{r load in data, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Load in the data
+
+survey <- read.csv(here("questionnaires.csv"))
+
+task <- read.csv(here("navon_task.csv"))
+
+```
+
+```{r selected variables, warning = FALSE,echo = FALSE, message=FALSE, results= 'hide'}
+
+## Selecting required variables
+
+survey <- survey %>% 
+                 select(ResponseId, 22:70)
+
+task <- task %>%
+            select(Participant.Public.ID, Zone.Type, 
+                   Response, Correct, attention,practice_attention,
+                   Reaction.Time, conditions, practice_conditions)
+
+```
+
+Loaded the data into Rstudio and selected the variables required for statistical analysis.
+
+## Data Wrangling
+
+### Dataset Modification 
+
+```{r selected variables, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Formatting existing variables
+
+## Select response rows
+task <- task %>%
+            subset(Zone.Type == "response_keyboard_single")
+
+## Combine test and practice sections due to randomization error
+task$instructed_attentional_focus <- paste(task$attention, task$practice_attention) # Attentional focus condition
+
+task$stimuli <- paste(task$conditions, task$practice_conditions) # Stimuli presented
+
+
+## Clean up dataframe 
+task <- task %>%
+            select(-Zone.Type) # remove column
+
+task <- task %>%
+           select(-attention, -practice_attention,
+                  -conditions, - practice_conditions) # remove columns
+
+survey <- survey[-c(1,2),] #remove unnecessary rows
+
+
+```
+
+Selected specific response rows in the dataframe that is needed for statistical analysis. The randomisation procedure in the task randomised the order of all trials rather than randomising the order of trials per block resulting in the denoted practice trials occurring at different temporal periods. To deal with this issue the test and practice sections labeled in the data was first combined. Any unnecessary rows and columns that is not needed for analysis was removed from the dataframe to improve readability. 
+
+
+```{r merging datasets, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Rename columns
+
+colnames(task)[1] <- "id"
+colnames(task)[2] <- "response"
+colnames(task)[3] <- "correct"
+colnames(task)[4] <- "response_time"
+
+colnames(survey)[1] <- "id"
+
+## Merge Dataframes
+
+df <- inner_join(task, survey, "id")
+
+```
+
+To help with readability and coding, some variables were renamed. The separate dataframes were merged by the function inner_join() to remove participants that did complete both the task and survey. 
+
+### Create New Identification Variables
+
+#### Trial Order and Blocks
+```{r new variables, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Create numeric ID
+df <- df %>% group_by(id) %>% 
+              mutate(id_num=cur_group_id()) 
+
+## Create trial number per participant
+df <- df %>% group_by(id) %>%
+              mutate(trial_num= row_number()) 
+
+## Code practice trials
+df <- df %>% mutate(trial_type = cut(trial_num, breaks=c(-Inf, 6.1, Inf), 
+                                     labels=c("practice","test"))) 
+
+## Code blocks of trails
+df <- df %>% mutate(block = cut(trial_num, breaks = c(0, 6.1, 18.1, 30.1,
+                                                      42.1, 54.1, 66.1,78.1),
+                    labels = c("practice", "block_1", "block_2", "block_3",
+                             "block_4", "block_5", "block_6"))) 
+
+## Delete practice trial rows
+
+df <- df %>%
+        subset(trial_type == "test") # Remove unnecessary responses
+
+## Remove trial_type column
+df <- df %>%
+            select(-trial_type) 
+
+```
+
+A numeric ID was created for easier readability. The temporal order of each trail is labeled per participant. The block number of the trials were labeled and practice trials were removed from the dataframe. 
+
+
+#### Switching Type per Trials and Previous Errors
+```{r switching coding, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Specify function from dplyr package
+recode <- dplyr::recode
+
+## Recode attention focus variable to numeric variable
+df <- df %>%
+  mutate(attention_num = recode(instructed_attentional_focus,
+                             "SMALL.jpg " = 1, " SMALL.jpg" = 1,
+                             "LARGE.jpg "= 2, " LARGE.jpg" = 2)) 
+
+## Create switching variables for each trial 
+## Based upon previous trial focus
+df<- df %>% group_by(id, block) %>% 
+           mutate(switch_type = 
+           if_else(lag(attention_num) == attention_num, "no_switch",
+           if_else((lag(attention_num) == 1 & attention_num == 2),"local_global",
+           if_else((lag(attention_num) == 2 & attention_num == 1),"global_local", "other")))) # Create categories
+
+
+## Code trials in which previous trial had error
+## Delete response time of rows in which previous trial has error
+df <- df %>% group_by(id,block) %>%
+         mutate(previous_error=
+         if_else(lag(correct) == 0, "yes", "no"))
+
+## Make NA from first trials in block equal no
+df$previous_error[is.na(df$previous_error)] <- "no"
+
+```
+
+A switch type variable was created to denote whether the trial represents a switch from a different attentional focus. This variable was created within blocks as it is not known whether participants took a break after completing a block of trials. A previous error variable was created to denote whether the previous trial contained an error response, this was created to capture unsuccessful attentional switching for later analyses.   
+
+#### Accuracy percentage
+
+```{r accuracy, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate accuracy percentage 
+df <- df %>% 
+  group_by(id) %>% 
+  mutate(accuracy = sum(correct)/n()*100)
+
+## See accuracy per participant
+acc <- df %>% select(id_num, id, accuracy) %>%
+              distinct(id, .keep_all = TRUE) %>% 
+              arrange(accuracy)
+
+```
+
+Create accuracy percentage for each participant.
+
+### Recode Survey Data 
+#### Autistic Traits
+```{r trait to numerical, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Temporarily load in package for recode process
+library(plyr)
+
+## Create recode function for traits
+recode_trait <- function(x) {
+  #recodes autistic traits items to numerical data
+  revalue(x, c('Definitely Agree' = 1, 'Agree'= 2, 'Disagree' = 3,
+               'Definitely Disagree' = 4)) } 
+
+## Apply function on all trait variables
+df[,9:20] <- lapply(df[,9:20], recode_trait)
+
+```
+
+```{r reverse code traits, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Make dataframe without reverse coding for checks later
+dfnrc <- df
+
+## Trait items 4, 6, 7 and 12 reverse coding
+## Create reverse coding function
+reverse_code <- function(x) {
+  # Reverse codes for items with 4 scales
+  revalue(x, c( "1" = 4, "2" = 3, "3" = 2, "4" = 1)) } 
+
+## Apply function on all bully variables
+df[c("TRAIT_4", "TRAIT_6", 
+     "TRAIT_7", "TRAIT_12")] <- lapply(df[c("TRAIT_4", "TRAIT_6",
+                                            "TRAIT_7", "TRAIT_12")],
+                                          reverse_code)
+
+## Change from traits from categorical to numeric variable
+df[,9:20] <- lapply(df[,9:20], as.numeric)
+dfnrc[,9:20] <- lapply(dfnrc[,9:20], as.numeric)
+
+
+
+```
+
+
+#### Psychotic-Like Experiences
+```{r recode ple data, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Create recode function for ple
+recode_ple <- function(x) {
+  #recodes ple items to numerical data
+  revalue(x, c("Nearly Always" = 3, "Often" = 2, 
+               "Sometimes" = 1, "Never" =0)) } 
+
+
+## Apply function on all ple variables
+df[,21:35] <- lapply(df[,21:35], recode_ple)
+
+## Change from categorical to numeric variable
+df[,21:35] <- lapply(df[,21:35], as.numeric)
+
+## Change age to numeric
+df[,8] <- lapply(df[,8],as.numeric)
+
+
+```
+
+#### Bully Scales
+```{r recode bully data, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Create recode function for bully
+recode_bully <- function(x) {
+  #recodes bully experience items to numerical data
+  revalue(x, c("Occurred several times a week" = 4, 
+               "Took place once a week" = 3,
+               "Occurred two or three times a month" = 2, 
+               "Took place once a month" = 1,
+               "Did not occur" = 0)) } 
+
+
+## Apply function on all bully variables
+df[,36:54] <- lapply(df[,36:54], recode_bully)
+
+## Change from categorical to numeric variable
+df[,36:54] <- lapply(df[,36:54], as.numeric)
+
+## Remove package to avoid masking effects
+detach(package:plyr)
+```
+
+## Data Cleaning
+
+### Trial Completion
+
+```{r check trials, warning = FALSE, echo= FALSE , message=FALSE,results= 'hide'}
+
+## See max trials per ppt
+trial <- aggregate(df$trial_num, by = list(df$id_num), max) 
+
+## See pppt who did not complete task
+trial %>% filter(x< 78) # ppt num 80 & 119 only completed 18 and 12 trials
+                        
+
+## Remove participants 80 & 199 due to insuffcient data
+df <-df[!(df$id_num == "80" | df$id_num =="119"),] 
+
+```
+
+Participants 80 and 119 were deleted from the analysis as after deducting the 6 practice trials they only have data from 12 and 6 trials respectively. All of the other participants completed all 78 trials. 
+
+
+### Dealing with Missing Data 
+
+```{r missing data, echo=FALSE, fig.show='hide', message=FALSE, warning=FALSE, results='hide'}
+
+## Make dataframe with unique observations for survey data
+na <- df %>%  
+         group_by(id_num) %>%
+         distinct(id_num, .keep_all = TRUE) 
+
+## Check amount of missing data
+summary(na)
+
+## Create function to measure percent of missing data
+pMiss <- function(x){sum(is.na(x))/length(x)*100}
+
+apply(na,2,pMiss) # Use function on columns
+apply(na,1,pMiss) # Use function on rows
+
+## Delete participant 138
+df <- df[!(df$id_num == "138"),]
+
+## Tempararily load packages
+library(mice)
+
+## Using predictive mean matching to impute missing data
+tempdata <- mice(df,m=5,maxit=50,meth='pmm',seed=500)
+
+## Convert into dataframe
+df <- complete(tempdata,1)
+
+## Remove package to avoid masking effects
+detach(package:mice)
+
+```
+
+Missing data is only present in the traditional bullying victimisation scale, this effect is likely due to the survey forcing a response from participants on other questionnaires. The number of missing data points range from 1 to 4 in each item. No item has over 5% missing data with the highest missing data being 1.4% in item 5. Participant number 138 did not answer any question on the traditional bullying victimisation scale. As such, participant 138 was listwise deleted from the analysis so that bias is not introduced from imputations. The remaining missing values were imputed using a predictive mean matching imputation approach. Only items 1, 3 and 6 had missing values following the deletion of participant 138.
+
+### Checking for Participants Compliance
+
+#### Congruency Errors with No switching
+
+```{r errors, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Create variable to detect congruent errors
+df5 <- df %>%  mutate(congruent_error =
+         if_else(correct == 0 & stimuli == "congruent_h.jpg ", "1",
+         if_else(correct == 0 & stimuli == " congruent_h.jpg", "1",
+         if_else(correct == 0 & stimuli == " congruent_s.jpg", "1", 
+         if_else(correct == 0 & stimuli == "congruent_s.jpg ", "1", "0")))))
+
+
+## Show only congruent errors
+df5 <- df5 %>% filter(congruent_error == "1" & switch_type == "no_switch") # 232 congruent errors in data set
+
+## Change from categorical to numeric variable
+df5[,63] <- lapply(df5[,63], as.numeric) 
+
+
+## Sum congruent errors with no switch per ppts
+df5 <- df5 %>% group_by(id_num) %>%
+           mutate(sum_no_switch_con_error = sum(congruent_error))
+
+## Check amount of errors below 60% accuracy 
+df6 <- df5 %>% select(id_num, response_time, accuracy, congruent_error, sum_no_switch_con_error, trial_num)  
+
+df6 <- df6 %>% distinct(id_num, .keep_all = TRUE)
+
+
+## Visualisation of errors and accuracy
+individual_plot <- ggplot(data = df6, aes(sum_no_switch_con_error, accuracy))+geom_line()+geom_point()+ scale_x_continuous(breaks= seq(0, 10, 1))
+
+print(individual_plot)
+## 4 and above errors appears to be out of character
+## 164, 114, 15, 140, 156, 228, 5, 202, 151, 29, 174, 257, 53
+
+
+## will check if at beginning of trial order
+df7 <- df5 %>% filter(id_num == 53)
+
+individual_plot <- ggplot(data = df7, aes(trial_num, sum_no_switch_con_error))+geom_line()+geom_point()+ scale_x_continuous(breaks= seq(0, 80, 10))
+
+print(individual_plot)
+
+
+```
+
+To gain an idea of participants that were compliant at the task instructions and were concentrating on the task, the amount of errors in congruent trails that did not require a switch in attention. This condition was the easiest so larger errors will indicate poorer compliance, a lack of concentration or a misunderstanding of the task instructions. 113 participants made at least one of these kinds of errors. When plotting accuracy in performance and the total of congruent no switching errors per participants 4 and more errors appear problematic. When these errors occurred in the task was visualised per participant and the following trends appeared. Participant number 164, 114, 15, 140, 156, 5, 202, 257 errors appeared throughout the temporal order of the trail. Whereas, 174 appeared near the beginning and end, 151 occurred near the end, 29, 228 and 53 occurred near the beginning. These participants will be considered for deletion whilst testing further issues. 
+
+#### Response Order
+
+```{r response, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide', eval = FALSE}
+
+
+## Graphics of response order
+
+## Create list for iteration
+id_num  <- c(1:280)
+
+## Make response plot per trail for each participant 
+for (i in unique(id_num)){
+  
+  d <- subset(df, id_num == i)
+  
+plot <- ggplot(data = d, aes(trial_num, response, group = id_num, colour = block)) + geom_line()+geom_point()+ ggtitle(paste("ID", i))
+
+print(plot)
+  
+}
+
+
+```
+
+A plot of each participants response over trials was created to identify any responses that demonstrate task non-compliance such as only one response in general or one response in each block. The analysis revealed that participant 257 only responded with "s" throughout  the task. It is difficult to determine if other responses are genuine from the plots. Participant 257 will be removed from the analysis 
+
+#### Response Switching
+
+```{r response switch, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+## Remove partcitipant
+
+df <- df[!(df$id_num == "257"),]
+
+
+## Response switching 
+
+## Create numerical response variable
+dfs <- df %>% mutate(num_response = if_else(response == "s", "1", if_else(response == "h", "0", "NA")))
+
+## Calcuate if response switch across trial occured
+df2 <- dfs %>% group_by(id) %>%
+       mutate(response_switch = ifelse(num_response == lag(num_response), "0", "1"))
+
+## Make numeric variable
+df2[,64] <- lapply(df2[,64], as.numeric) 
+
+## Add each participants total number of switching
+df3 <- df2 %>% filter(response_switch == 1)
+df3 <- df3 %>% group_by(id) %>%
+      mutate(tot_response_switch = sum(response_switch))
+
+df3 <- df3 %>% select(id, id_num, tot_response_switch, accuracy) %>% 
+  distinct(id_num, .keep_all = TRUE)
+
+## Visualisation of response switching and accuracy
+
+individual_plot <- ggplot(data = df3, aes(tot_response_switch, accuracy))+geom_line()+geom_point()+ scale_x_continuous(breaks= seq(20, 60, 2))
+
+print(individual_plot)
+
+```
+
+Number of switches between trials did not seem to predict accuracy.
+
+### Survey Response Order
+
+Basically check by selecting relevant columns and going through. Visualisations with number at side and questions at bottom per ppts with reverse code item highlighted. 
+#### Autistic Trait Response Order
+
+```{r trait order, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide', eval = FALSE}
+
+## Graphics of response order
+## Create list for iteration
+id_num  <- c(1:280)
+
+## Make response plot per trail for each participant 
+for (i in unique(id_num)){
+  
+  d <- subset(dfnrc, id_num == i)
+  
+  d <- d %>%select(id_num, TRAIT_1:TRAIT_12) %>%
+  pivot_longer(., cols = c(TRAIT_1:TRAIT_12), names_to = "traits", values_to = "score") 
+  
+  d <- d %>% mutate(reversed = ifelse(traits == "TRAIT_4", "yes", ifelse(traits == "TRAIT_6", "yes", ifelse(traits == "TRAIT_7", "yes", ifelse(traits == "TRAIT_12", "yes", "no")))))
+  
+    d <- d %>% mutate(scale = 
+                        ifelse(traits ==c("TRAIT_1","TRAIT_4","TRAIT_7", "TRAIT_9","TRAIT_11"), "ss", 
+                        ifelse(traits == "TRAIT_3", "c", 
+                        ifelse(traits == "TRAIT_6", "c", 
+                        ifelse(traits == "TRAIT_8", "c", "as")))))
+                                 
+  
+  order <- factor(d$traits, level = c("TRAIT_1", "TRAIT_2", "TRAIT_3", "TRAIT_4", "TRAIT_5", "TRAIT_6", "TRAIT_7", "TRAIT_8", "TRAIT_9", "TRAIT_10", "TRAIT_11", "TRAIT_12"))
+  
+plot <- ggplot(data = d, aes(order, score, colour = reversed, group = id_num, shape = scale)) + geom_line(colour = "black")+geom_point(size = 5)+ ggtitle(paste("ID", i)) + scale_y_continuous(limits = c(1, 4)) 
+
+print(plot)
+  
+}
+
+  
+```
+
+The response order for the autistic trait survey was graphically represented. The dataframe used did not include the reversed coded traits so the response order is unchanged. Reverse items and the scale type are depicted within the visualisation. Straight-lining responses and generally straightline responses that did not deviate in terms of reserve coded items was looked for to represent non-compliance. Participant 26 straight-lined to questionnaire only answering with one response. Whereas participants 96, 52, 122 and 138 generally answered within a straight line that did not deviate in terms of reverse questions. 
+
+#### Psychotic-Like Experiences Response Order
+
+```{r ple order, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide', eval = FALSE}
+
+## Graphics of response order
+## Create list for iteration
+id_num  <- c(1:280)
+
+## Make response plot per trail for each participant 
+for (i in unique(id_num)){
+  
+  d <- subset(df, id_num == i)
+  
+  d <- d %>%select(id_num, PLE_1:PLE_15) %>%
+  pivot_longer(., cols = c(PLE_1:PLE_15), names_to = "ple", values_to = "score") 
+  
+  
+    d <- d %>% mutate(scale = 
+                        ifelse(ple == "PLE_1", "pi",
+                        ifelse(ple == "PLE_3", "pi",
+                        ifelse(ple == "PLE_4", "pi",
+                        ifelse(ple == "PLE_5", "pi",   
+                        ifelse(ple == "PLE_6", "pi", 
+                        ifelse(ple == "PLE_8", "pa", 
+                        ifelse(ple == "PLE_10", "pa", 
+                        ifelse(ple == "PLE_14", "pa", "be")))))))))
+                                 
+    order <- factor(d$ple, level = c("PLE_1", "PLE_2", "PLE_3", "PLE_4", "PLE_5", "PLE_6", "PLE_7", "PLE_8", "PLE_9", "PLE_10", "PLE_11", "PLE_12", "PLE_13", "PLE_14", "PLE_15"))
+  
+ 
+  
+plot <- ggplot(data = d, aes(order, score, colour = scale, group = id_num, shape = scale)) + geom_line(colour = "black")+geom_point(size = 5)+ ggtitle(paste("ID", i)) + scale_y_continuous(limits = c(0, 3)) 
+
+print(plot)
+  
+}
+  
+```
+ 
+ The response order for the psychotic-like experiences survey was graphically represented. Scales were colour coded. Four participants responded in complete straight lines with participant 10 and 26 being above 0 and 154 and 166 being at 0. 
+ 
+ 
+
+#### Bullying frequency Response Order
+
+```{r bully order, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide', eval = FALSE}
+
+## Graphics of response order
+## Create list for iteration
+id_num  <- c(1:280)
+
+## Make response plot per trail for each participant 
+for (i in unique(id_num)){
+  
+  d <- subset(df, id_num == i)
+  
+  d <- d %>%select(id_num, TBV.1_1:TBV.1_8, CBV.1_1:CBV.1_11) %>%
+  pivot_longer(., cols = c(TBV.1_1:TBV.1_8, CBV.1_1:CBV.1_11), names_to = "bully", values_to = "score") 
+  
+  
+    d <- d %>% mutate(scale = 
+                        ifelse(bully == "TBV.1_1", "tbv",
+                        ifelse(bully == "TBV.1_2", "tbv",
+                        ifelse(bully == "TBV.1_3", "tbv",
+                        ifelse(bully == "TBV.1_4", "tbv",   
+                        ifelse(bully == "TBV.1_5", "tbv", 
+                        ifelse(bully == "TBV.1_6", "tbv", 
+                        ifelse(bully == "TBV.1_7", "tbv", 
+                        ifelse(bully == "TBV.1_8", "tbv", "cbv")))))))))
+                                 
+    order <- factor(d$bully, level = c("TBV.1_1", "TBV.1_2", "TBV.1_3", "TBV.1_4", "TBV.1_5", "TBV.1_6", "TBV.1_7", "TBV.1_8", "CBV.1_1", "CBV.1_2", "CBV.1_3", "CBV.1_4", "CBV.1_5", "CBV.1_6", "CBV.1_7", "CBV.1_8", "CBV.1_9", "CBV.1_10", "CBV.1_11"))
+  
+ 
+  
+plot <- ggplot(data = d, aes(order, score, colour = scale, group = id_num, shape = scale)) + geom_line(colour = "black")+geom_point(size = 5)+ ggtitle(paste("ID", i)) + scale_y_continuous(limits = c(0, 4)) 
+
+print(plot)
+  
+}
+  
+```
+ 
+The response order of both traditional and cyber bullying victimisation scale was graphically visualised. Straight line responses only occurred for 0 representing no bullying experiences. The respondents for these were 2, 5, 8, 16, 17, 22, 37, 46, 48, 79, 81, 90, 108, 116, 161, 166, 170, 188, 190, 201, 215, 228, 239, 243, 246, 267, 271, 272, 278.
+
+
+### Calculating Questionnaire Indices
+
+#### Autism Trait Index
+
+```{r as index, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+select <- dplyr::select # save as function due to masking
+
+## Create data frame for unique cases
+df_as_index <- df %>%  # Calculate index
+       group_by(id) %>%
+       distinct(id, .keep_all = TRUE) %>%
+       mutate(as_index = sum(TRAIT_1,TRAIT_2,TRAIT_3,TRAIT_4,TRAIT_5,
+                             TRAIT_6,TRAIT_7, TRAIT_8, TRAIT_9, TRAIT_10,
+                             TRAIT_11, TRAIT_12))
+
+## Select relevent variables
+df_as_index <- df_as_index %>% select(id, as_index) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_as_index, "id") #merge column
+
+
+df4 <- df %>% select(id_num, as_index) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$as_index)
+plot(density(df4$as_index))
+hist(df4$as_index) 
+
+
+
+```
+One participant, number 165, scored high on the index
+
+##### Social Skills Subscale
+
+```{r social skills, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate social skill sub scale
+## Create data frame for unique cases
+df_social_skills <- df %>%  # Social skills scale (Traits 1, 4, 7, 9, 11)
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(social_skills = sum(TRAIT_1,TRAIT_4,TRAIT_7,
+                             TRAIT_9, TRAIT_11))
+
+## Select relevant variables
+df_social_skills <- df_social_skills %>% select(id, social_skills) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_social_skills, "id") #merge column
+
+
+df4 <- df %>% select(id_num, social_skills) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$social_skills)
+plot(density(df4$social_skills))
+hist(df4$social_skills) 
+
+```
+
+Participant 118, 259, 184 scored low at 5
+Participant 248, 165, 18, 219, 160 scored high at 20. 
+
+##### Attention Switching Subscale
+```{r attention swtiching, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+## Calculate attention switching sub scale
+## Create data frame for unique cases
+df_attention_switching <- df %>%  # Attention switching scale (Traits 2, 5, 10, 12)
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(attention_switching = sum(TRAIT_2,TRAIT_5,TRAIT_10,TRAIT_12))
+
+## Select relevant variables
+df_attention_switching <- df_attention_switching %>% select(id, attention_switching) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_attention_switching, "id") #merge column
+
+df4 <- df %>% select(id_num, attention_switching) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$attention_switching)
+plot(density(df4$attention_switching))
+hist(df4$attention_switching)
+
+```
+Participant 165 is an outlier scoring higher than other participants. 
+
+##### Communication Subscale
+
+```{r attention swtiching, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate communication sub scale
+## Create data frame for unique cases
+df_communication <- df %>%  # Communication scale (Traits 3, 6, 8)
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(communication = sum(TRAIT_3,TRAIT_6,TRAIT_8))
+
+## Select relevant variables
+df_communication <- df_communication %>% select(id, communication) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_communication, "id") #merge column
+
+df4 <- df %>% select(id_num, communication) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$communication)
+plot(density(df4$communication))
+hist(df4$communication)
+
+```
+
+No outliers in the communication subscale. 
+
+#### Psychotic-like Experiences Index
+
+```{r ple index, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate PLE sum
+## Create data frame for unique cases
+df_ple_score <- df %>%  # Calculate score
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(ple_score = sum(PLE_1, PLE_2,PLE_3,PLE_4, PLE_5, PLE_6,
+                        PLE_7, PLE_8, PLE_9, PLE_10, PLE_11, PLE_12,
+                        PLE_13, PLE_14, PLE_15))
+
+## Select relevant variables
+df_ple_score <- df_ple_score %>% select(id, ple_score) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_ple_score, "id") #merge column
+
+df4 <- df %>% select(id_num, ple_score) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$ple_score)
+plot(density(df4$ple_score))
+hist(df4$ple_score)
+
+```
+Has many outliers above 20. In paticular 185, 3, 156. Other outliers include 264, 65, 213, 153, 39, 194, 15, and 76.
+
+##### Index Without Perceptual Abnormalities
+
+```{r ple_be_pi index, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+## Calculate ple total without perceptual abnormalities
+## Create data frame for unique cases
+df_ple_be_pi <- df %>%
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(ple_be_pi = sum(PLE_1, PLE_2, PLE_3, PLE_4, PLE_5, 
+                         PLE_6, PLE_7, PLE_9, PLE_11, PLE_12,
+                         PLE_13, PLE_15))
+
+## Select relevant variables
+df_ple_be_pi <- df_ple_be_pi %>% select(id, ple_be_pi) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_ple_be_pi, "id") #merge column
+
+df4 <- df %>% select(id_num, ple_be_pi) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$ple_be_pi)
+plot(density(df4$ple_be_pi))
+hist(df4$ple_be_pi)
+
+```
+
+High outliers again but extreme with only 185, 3 and 156 and 164 being another. 
+
+##### Persecutary Ideation Subscale
+
+```{r pi, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate persecutory ideation sub scale
+## Create data frame for unique cases
+df_pers_idea <- df %>%  # Persecutory ideation (1, 3, 4, 5, 6)
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(pi_scale = sum(PLE_1, PLE_3,PLE_4,PLE_5, PLE_6))
+
+## Select relevant variables
+df_pers_idea <- df_pers_idea %>% select(id, pi_scale) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_pers_idea, "id") #merge column
+
+df4 <- df %>% select(id_num, pi_scale) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$pi_scale)
+plot(density(df4$pi_scale))
+hist(df4$pi_scale)
+
+```
+
+Participant 130, 185, 156 and 144 are outliers. 
+
+##### Bizzare Experiences Subscale
+
+```{r be, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate bizzare experiences sub scale
+## Create data frame for unique cases
+df_bizz_exp <- df %>%  # Bizzare experiences (2, 7, 9, 11, 12, 13,15)
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(be_scale = sum(PLE_2, PLE_7,PLE_9,PLE_11,
+                        PLE_12, PLE_13, PLE_15))
+                        
+## Select relevant variables
+df_bizz_exp <- df_bizz_exp %>% select(id, be_scale) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_bizz_exp, "id") #merge column
+
+df4 <- df %>% select(id_num, be_scale) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$be_scale)
+plot(density(df4$be_scale))
+hist(df4$be_scale)
+```
+
+Outling participants are 185, 3, 156, 213, 264, 65, 194, 39, 229, 76 and 59
+
+##### Perceptual Abnormalities Subscale
+
+```{r pa, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate perceptual abnormalities sub scale
+## Create data frame for unique cases
+df_perc_abn <- df %>%  # Perceptual abnormalities (8, 10, 14)
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(pa_scale = sum(PLE_8, PLE_10, PLE_14))
+
+## Select relevant variables
+df_perc_abn <- df_perc_abn %>% select(id, pa_scale) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_perc_abn, "id") #merge column
+
+
+df4 <- df %>% select(id_num, pa_scale) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$pa_scale)
+plot(density(df4$pa_scale))
+hist(df4$pa_scale)
+```
+
+The main outliers are 3, 185, 65, 156
+
+#### Bullying Victimisation Frequency Index
+```{r bully index, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate overall bullying victimisation sum
+## Create data frame for unique cases
+df_bully_score <- df %>% 
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(bully_score = sum(CBV.1_1, CBV.1_2, CBV.1_3, CBV.1_4, CBV.1_5,
+                           CBV.1_6, CBV.1_7, CBV.1_8, CBV.1_9, CBV.1_10,
+                           CBV.1_11, TBV.1_1, TBV.1_2, TBV.1_3, TBV.1_4,
+                           TBV.1_5, TBV.1_6, TBV.1_7, TBV.1_8)) 
+
+## Select relevant variables
+df_bully_score <- df_bully_score %>% select(id, bully_score) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_bully_score, "id") #merge column
+
+df4 <- df %>% select(id_num, bully_score) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$bully_score)
+plot(density(df4$bully_score))
+hist(df4$bully_score)
+
+```
+
+Outliers include 50, 213, 156, 245, 10, 120, 181, 76, 105, 265, 158, 121, 34, 259, 53.
+
+##### Traditionaly Bullying Victimisation Frequency Subscale
+```{r tbv scale, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate traditional bullying victimisation sum
+## Create data frame for unique cases
+df_tbv_score <- df %>%  
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(tbv_score = sum(TBV.1_1, TBV.1_2, TBV.1_3, TBV.1_4, 
+                         TBV.1_5, TBV.1_6, TBV.1_7, TBV.1_8))
+
+## Select relevant variables
+df_tbv_score <- df_tbv_score %>% select(id, tbv_score) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_tbv_score, "id") #merge column
+
+df4 <- df %>% select(id_num, tbv_score) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$tbv_score)
+plot(density(df4$tbv_score))
+hist(df4$tbv_score)
+
+```
+
+Outliers include 53,  259, 265, 105, 181, 137, 76, 264, 180, 103, 20, 120, 34, 10, 245, 158, 15, 247
+
+##### Cyberbullying Victimisation Frequency Subscale
+```{r cbv scale, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculate cyber bullying victimisation sum
+## Create data frame for unique cases
+df_cbv_score <- df %>%  
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(cbv_score = sum(CBV.1_1, CBV.1_2, CBV.1_3, CBV.1_4, CBV.1_5,
+                         CBV.1_6, CBV.1_7, CBV.1_8, CBV.1_9, CBV.1_10,
+                         CBV.1_11)) 
+
+## Select relevant variables
+df_cbv_score <- df_cbv_score %>% select(id, cbv_score) #remove columns
+
+## Merge datafames
+df <- inner_join(df, df_cbv_score, "id") #merge column
+
+df4 <- df %>% select(id_num, cbv_score) %>%
+             distinct(id_num, .keep_all = TRUE)
+
+## Check for  univariate outliers
+boxplot(df4$cbv_score)
+plot(density(df4$cbv_score))
+hist(df4$cbv_score)
+
+```
+
+The main outliers include 50, 213, 156, 245 and 10
+
+### Trimming Response Time Data
+#### Dealing With Extreme Outliers
+
+```{r delete rows, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Delete response time based upon previous_error
+df <- df %>% subset(previous_error != "yes")
+
+## Delete rows of data that have errors 
+df <- df[!df$correct == "0",]
+
+## Delete rows without switching type information
+df <- df[!is.na(df$switch_type), ]
+
+```
+
+df2 <- df %>% select (id_num, switch_type) %>% distinct(switch_type, .keep_all = TRUE) 
+Delete data that we are not interested in analysing.
+
+```{r remove extremes, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## See response time per participant
+response <- df %>% select(id_num, response_time) %>%
+              arrange(response_time)
+
+## Create visualisation of each participants rt per block
+individual_plot <- ggplot(data = df, aes(block, response_time, group = id))+geom_line()+geom_point()
+
+print(individual_plot)
+
+## Remove extreme outliers
+df <- df %>% filter(response_time < 3000)
+df <- df %>% filter(response_time > 200)
+
+
+## Delete response times 2 SD above and below for each switch type per participant
+df <- df %>% group_by(id, switch_type) %>% 
+           mutate(avg = mean(response_time), stdev = sd(response_time))
+
+df <- df %>% group_by(id, switch_type) %>%
+  filter(response_time <= 2*stdev+avg)
+df <- df %>% group_by(id, switch_type) %>%
+  filter(response_time >= avg - (2*stdev))
+
+## Create plot
+plot(density(df$response_time))
+boxplot(df$response_time)
+
+## Look for missing data
+df2 <- df %>% select (id_num, switch_type) %>% group_by(switch_type) %>% distinct(id_num, .keep_all = TRUE)
+
+df2 <- df2 %>% filter(switch_type == "global_local")
+```
+
+Large reaction time values, above 3000ms, according to the visualisations were removed to not bias trimming of response time data. Trails with response times lower than 200ms were removed as it was deemed unlikely for the to capture the psychological construct due to motor responses and cognitive processing time. Participants response times were then trimmed according to switch type so that systematic bias is not introduced by 2 standard deviations below and above the mean. This was to remove the influence of outliers when creating the response time indices. This procedure left participant 5, 114 and 156 without a global to local switching cost trails.  
+
+### Calculate Switching Response Time Means
+#### No Switch Mean
+```{r mean no switch, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Calculating mean switching response times per type
+df_rt <- df %>% 
+  group_by(id, switch_type) %>% 
+  summarise(mean_rt = mean(response_time)) 
+
+## Adding no_switch mean column
+df_no_switch <- df_rt %>%
+  filter(switch_type == "no_switch") #localised no_switch rt
+
+## Rename column
+colnames(df_no_switch)[3] <- "no_switch_mean_rt"
+
+## Remove columns
+df_no_switch <- df_no_switch %>%
+  select(id,no_switch_mean_rt)
+
+## Merge dataframes
+df <- inner_join(df, df_no_switch, "id") 
+
+## Ungroup switch typw
+
+df <- df %>% 
+  ungroup(switch_type)
+
+df2 <- df %>% select(id_num, no_switch_mean_rt)   %>%
+  distinct(id_num, .keep_all = TRUE)
+
+## Create plot
+plot(density(df2$no_switch_mean_rt))
+boxplot(df2$no_switch_mean_rt)
+
+individual_plot <- ggplot(data = df2, aes(id_num, no_switch_mean_rt, group = id_num))+geom_line()+geom_point()
+
+print(individual_plot)
+
+```
+Outliers include 114, 44, 33, 265, 212, 194, 8, 88, 185
+
+#### Global to Local Switch Mean
+```{r mean global local switch, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Adding global_local switch mean column
+df_global_local <- df_rt %>%
+  filter(switch_type == "global_local") #localised global_local rt
+
+## Rename column
+colnames(df_global_local)[3] <- "global_local_switch_mean_rt"
+
+## Remove columns
+df_global_local <- df_global_local %>%
+  select(id,global_local_switch_mean_rt)
+
+## Merge dataframes
+df <- inner_join(df, df_global_local, "id") 
+
+## Ungroup switch type
+df <- df %>% 
+  ungroup(switch_type)
+
+df2 <- df %>%  select(id_num, global_local_switch_mean_rt)   %>%
+  distinct(id_num, .keep_all = TRUE)
+
+## Create plot
+plot(density(df2$global_local_switch_mean_rt))
+boxplot(df2$global_local_switch_mean_rt)
+
+individual_plot <- ggplot(data = df2, aes(id_num, global_local_switch_mean_rt, group = id_num))+geom_line()+geom_point()
+
+print(individual_plot)
+
+```
+Outliers include 105, 33, 218, 212, 29, 11. These functions removed participant 5, 114 and 156 from the analysis. 
+
+#### Local to Global Mean
+```{r mean local global switch, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Adding local_global switch mean column 
+df_local_global <- df_rt %>%
+    filter(switch_type == "local_global") #localised local_global rt
+
+## Rename column
+colnames(df_local_global)[3] <- "local_global_switch_mean_rt"
+
+## Remove columns
+df_local_global <- df_local_global %>%
+  select(id,local_global_switch_mean_rt) 
+
+## Merge dataframes
+df <- inner_join(df, df_local_global, "id") 
+
+## Ungroup switch type
+df <- df %>% 
+  ungroup(switch_type)
+
+df2 <- df %>%  select(id_num, local_global_switch_mean_rt)   %>%
+  distinct(id_num, .keep_all = TRUE)
+
+## Create plot
+plot(density(df2$local_global_switch_mean_rt))
+boxplot(df2$local_global_switch_mean_rt)
+
+individual_plot <- ggplot(data = df2, aes(id_num, local_global_switch_mean_rt, group = id_num))+geom_line()+geom_point()
+
+print(individual_plot)
+
+df2 <- df %>%
+    group_by(id_num, switch_type) %>%
+    summarise(count=n())
+
+```
+Some outliers include 19, 265, 212, 29,  194, 11, 238, 33, 69, 205. 
+
+#### Bivariate Means
+```{r mean global local no switch, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, no_switch_mean_rt, global_local_switch_mean_rt) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(df2$global_local_switch_mean_rt, df2$no_switch_mean_rt)
+
+## Create plot
+
+
+individual_plot <- ggplot(data = df2, aes(no_switch_mean_rt, global_local_switch_mean_rt))+geom_smooth(method = 'lm') +geom_point()+ 
+              scale_y_continuous(limits = c(250, 2500)) + 
+              scale_x_continuous(limits = c(250, 2250))
+
+print(individual_plot)
+
+df2 <- df2 %>% filter(id_num != 88)
+
+individual_plot <- ggplot(data = df2, aes(no_switch_mean_rt, global_local_switch_mean_rt))+geom_smooth(method = 'lm') +geom_point()+ 
+              scale_y_continuous(limits = c(250, 2500)) + 
+              scale_x_continuous(limits = c(250, 2250))
+
+print(individual_plot)
+
+```
+
+Point 88 seems to be a bivariate outlier, remove to check. Does seem to influence relationship.
+
+```{r mean local global no switch, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, no_switch_mean_rt, local_global_switch_mean_rt) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(df2$local_global_switch_mean_rt, df2$no_switch_mean_rt)
+
+## Create plot
+
+
+individual_plot <- ggplot(data = df2, aes(no_switch_mean_rt, local_global_switch_mean_rt))+geom_smooth(method = 'lm') +geom_point()+ 
+              scale_y_continuous(limits = c(250, 2000)) + 
+              scale_x_continuous(limits = c(250, 2250)) 
+
+print(individual_plot)
+
+df2 <- df2 %>% filter(id_num != 88)
+
+individual_plot <- ggplot(data = df2, aes(no_switch_mean_rt, local_global_switch_mean_rt))+geom_smooth(method = 'lm') +geom_point() + 
+              scale_y_continuous(limits = c(250, 2000)) + 
+              scale_x_continuous(limits = c(250, 2250))
+
+print(individual_plot)
+
+```
+
+88 seems to be an outlier again. Removing outlier improves fit a little. 
+
+
+### Calculating Switching Cost Indices
+
+#### Global to Local Switching Cost
+
+```{r switching cost indices, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Global_local switching cost index
+## Global-local switching rt minus no switch 
+df <- df %>% 
+  group_by(id) %>% 
+  mutate(global_local_cost_index = global_local_switch_mean_rt - no_switch_mean_rt)
+
+df2 <- df %>% 
+  distinct(id, .keep_all = TRUE)
+
+glob_loc_cost<- df2 %>% select(id_num, global_local_cost_index) 
+
+plot(density(df2$global_local_cost_index))
+boxplot(df2$global_local_cost_index)
+
+individual_plot <- ggplot(data = df2, aes(id_num, global_local_cost_index, group = id_num))+geom_line()+geom_point()
+
+print(individual_plot)
+
+```
+
+
+Paticularily 105 being high and 88 being low
+
+#### Local to Global Cost Indices 
+
+```{r local global cost indices, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Local_global switching cost index
+## Local-global switching rt minus no-switching rt
+df <- df %>% 
+  group_by(id) %>% 
+  mutate(local_global_cost_index = local_global_switch_mean_rt - no_switch_mean_rt)
+
+df2 <- df %>% 
+  distinct(id, .keep_all = TRUE)
+
+loc_glob_cost<- df2 %>% select(id_num, local_global_cost_index) %>%
+              arrange(local_global_cost_index)
+
+plot(density(df2$local_global_cost_index))
+
+boxplot(df2$local_global_cost_index)
+
+individual_plot <- ggplot(data = df2, aes(id_num, local_global_cost_index, group = id_num))+geom_line()+geom_point()
+
+print(individual_plot)
+
+
+```
+
+88, outlier
+
+#### Bivariate Indices
+```{r local global cost indices, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, global_local_cost_index, local_global_cost_index) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(df2$global_local_cost_index, df2$local_global_cost_index)
+
+## Create plot
+
+
+individual_plot <- ggplot(data = df2, aes(local_global_cost_index, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point()
+
+print(individual_plot)
+
+```
+
+### Delete Univariate Outliers in Response Time Data 
+
+```{r remove univariate response outlier, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df <-df[!(df$id_num == "88" | df$id_num =="105"),] 
+
+```
+
+Participants were removed due to the strong influence biasing results.
+
+### Examining Bivariate Outliers
+
+#### Global to Local Cost Index Outliers
+
+##### Autism Trait Index 
+
+```{r bivarate as trait global local, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, global_local_cost_index, as_index) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$as_index,df2$global_local_cost_index),pch=16,cex=2)
+
+individual_plot <- ggplot(data = df2, aes(as_index, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(10, 50))
+
+print(individual_plot)
+
+## Remove highest outlier
+df2 <- df2[!(df2$id_num =="175"),] 
+
+
+individual_plot <- ggplot(data = df2, aes(as_index, global_local_cost_index))+geom_smooth(method = 'lm') +geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(10, 50))
+
+print(individual_plot)
+
+## Remove rest of outliers
+df2 <- df2[!(df2$id_num =="218"| df2$id_num =="25"|
+             df2$id_num =="29"),] 
+
+
+individual_plot <- ggplot(data = df2, aes(as_index, global_local_cost_index))+geom_smooth(method = 'lm') +geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(10, 50))
+
+print(individual_plot)
+
+```
+
+175, 218, 25 and 29 are outliers. 175 strongly influences the relationship direction whereas the other outliers mainly influence the intercept. 175 will be removed from the data later. 
+
+##### Perceptual Abnormalities
+
+```{r bivarate pa scale global local, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, global_local_cost_index, pa_scale) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$pa_scale,df2$global_local_cost_index),pch=16,cex=2)
+
+individual_plot <- ggplot(data = df2, aes(pa_scale, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(0, 10))
+
+print(individual_plot)
+
+## Remove univariate outliers
+df2 <- df2[!(df2$id_num =="3" | df2$id_num =="185" |
+             df2$id_num =="65"),] 
+
+individual_plot <- ggplot(data = df2, aes(pa_scale, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(0, 10))
+
+print(individual_plot)
+
+```
+There are no outliers concerning the bag plot but univariate outliers 3, 185 and 65 are checked to determine if influence direction of relationship. Removing the outliers did not effect the relationship much.  
+
+##### Bizzare Experiences and Persecutary Ideation
+
+```{r bivarate ple be pi global local, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, global_local_cost_index, ple_be_pi) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$ple_be_pi,df2$global_local_cost_index),pch=16,cex=2)
+
+individual_plot <- ggplot(data = df2, aes(ple_be_pi, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(0, 35))
+
+
+print(individual_plot)
+
+## Check if removed all
+df2 <- df2[!(df2$id_num =="175"),] 
+
+individual_plot <- ggplot(data = df2, aes(ple_be_pi, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(0, 35))
+
+
+print(individual_plot)
+
+## Check if removed all
+df2 <- df2[!(df2$id_num =="175"|df2$id_num =="25"),] 
+
+individual_plot <- ggplot(data = df2, aes(ple_be_pi, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(0, 35))
+
+
+print(individual_plot)
+
+df2 <- df2[!(df2$id_num =="175"|df2$id_num =="25"
+             |df2$id_num =="185"|df2$id_num =="3"),] 
+
+individual_plot <- ggplot(data = df2, aes(ple_be_pi, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(0, 35))
+
+print(individual_plot)
+
+
+df2 <- df2[!(df2$id_num =="175"|df2$id_num =="25"|df2$id_num =="218" 
+             |df2$id_num =="185"|df2$id_num =="3"),] 
+
+individual_plot <- ggplot(data = df2, aes(ple_be_pi, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-400, 600)) + 
+              scale_x_continuous(limits = c(0, 35))
+
+print(individual_plot)
+
+
+```
+The same outliers that influenced autism trait index is in this 175, 218 and 25. In addition to 185 and 3 as univariate outliers in perceptual abnormalities. As outliers have an impact on the relationship and removing them will make other outliers stronger in other relationships. All outliers will be removed.
+
+
+##### Bullying 
+
+```{r bivarate pa scale global local, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, bully_score, global_local_cost_index) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$buly_score,df2$global_local_cost_index))
+
+individual_plot <- ggplot(data = df2, aes(bully_score, global_local_cost_index)) +geom_smooth(method = 'lm') + geom_point()
+
+print(individual_plot)
+
+```
+
+Again, 175, 218 and 25 are outliers
+
+#### Local to Global Cost Index Outliers
+
+##### Autism Trait Index
+
+```{r bivarate as trait local global, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, local_global_cost_index, as_index) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$as_index,df2$local_global_cost_index),pch=16,cex=2)
+
+individual_plot <- ggplot(data = df2, aes(as_index, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_x_continuous(limits = c(10, 50)) + 
+              scale_y_continuous(limits = c(-300, 600))
+
+print(individual_plot)
+
+df2 <- df2[!(df2$id_num =="259"|df2$id_num =="165"),] 
+
+individual_plot <- ggplot(data = df2, aes(as_index, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point()+ scale_x_continuous(limits = c(10, 50)) + 
+              scale_y_continuous(limits = c(-300, 600))
+
+print(individual_plot)
+
+df2 <- df2[!(df2$id_num =="164"|df2$id_num =="19"),] 
+
+individual_plot <- ggplot(data = df2, aes(as_index, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point()+ scale_x_continuous(limits = c(10, 50)) + 
+              scale_y_continuous(limits = c(-300, 600))
+
+print(individual_plot)
+
+```
+
+Outliers most likely to effect relationship is 259 and 165. Removing them does not effect the relationship much. 164 and 19 hardly effect relationship. 
+
+##### Perceptual Abnormalities
+
+```{r bivarate pa scale local global, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, local_global_cost_index, pa_scale) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$pa_scale,df2$local_global_cost_index),pch=16,cex=2)
+
+individual_plot <- ggplot(data = df2, aes(pa_scale, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-300, 600)) + 
+              scale_x_continuous(limits = c(0, 10))
+
+print(individual_plot)
+
+df2 <- df2[!(df2$id_num =="3"|df2$id_num =="185"|df2$id_num =="65"),]
+
+individual_plot <- ggplot(data = df2, aes(pa_scale, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-300, 600)) + 
+              scale_x_continuous(limits = c(0, 10))
+
+print(individual_plot)
+
+``` 
+
+The univariate outliers stronger influences the relationship, these will be removed due to previous analyses anyway. 
+
+##### Bizzare Experiences and Persecutary Ideation
+
+```{r bivarate ple be pi local global, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, local_global_cost_index, ple_be_pi) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$ple_be_pi,df2$local_global_cost_index),pch=16,cex=2)
+
+individual_plot <- ggplot(data = df2, aes(ple_be_pi, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-300, 600)) + 
+              scale_x_continuous(limits = c(0, 35))
+
+
+print(individual_plot)
+
+df2 <- df2[!(df2$id_num =="3"|df2$id_num =="185"),]
+individual_plot <- ggplot(data = df2, aes(ple_be_pi, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-300, 600)) + 
+              scale_x_continuous(limits = c(0, 35))
+
+
+print(individual_plot)
+
+
+df2 <- df2[!(df2$id_num =="3"|df2$id_num =="164"),]
+individual_plot <- ggplot(data = df2, aes(ple_be_pi, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_y_continuous(limits = c(-300, 600)) + 
+              scale_x_continuous(limits = c(0, 35))
+
+
+print(individual_plot)
+
+```
+185 and 3 influence the relationship but this will be removed anyway. 164 slightly influences the relationship
+
+
+##### Bullying 
+
+```{r bivarate bully local global, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, bully_score, local_global_cost_index) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$buly_score,df2$local_global_cost_index))
+
+individual_plot <- ggplot(data = df2, aes(bully_score, local_global_cost_index)) +geom_smooth(method = 'lm') + geom_point()
+
+print(individual_plot)
+
+```
+No outliers
+
+
+#### Remove Reaction Time Outliers 
+```{r bivarate bully local global, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df <- df[!(df$id_num =="175"|df$id_num =="218"| 
+           df$id_num =="25"|df$id_num =="29"| 
+           df$id_num =="3"|df$id_num =="185"| 
+           df$id_num =="65"|df$id_num =="164"| 
+           df$id_num =="19"|df$id_num =="165"| 
+           df$id_num =="259"),]
+
+```
+
+Due to the influence of univariate and bivariate outliers influence on many relationships. All are removed from analysis.
+
+#### Bizzare Experiences and Persecutary Ideation Outliers
+
+##### Autism Trait Index
+
+```{r bivarate as trait local global, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, ple_be_pi, as_index) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$as_index,df2$ple_be_pi),pch=16,cex=2)
+
+individual_plot <- ggplot(data = df2, aes(as_index, ple_be_pi)) +geom_smooth(method = 'lm') + geom_point() + 
+              scale_x_continuous(limits = c(10, 50)) + 
+              scale_y_continuous(limits = c(0, 30))
+
+print(individual_plot)
+```
+No outliers.
+
+
+##### Perceptual Abnormalities
+
+```{r bivarate pa scale local global, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, ple_be_pi, pa_scale) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$pa_scale,df2$ple_be_pi),pch=16,cex=2)
+
+individual_plot <- ggplot(data = df2, aes(pa_scale, ple_be_pi)) +geom_smooth(method = 'lm') + geom_point() 
+
+print(individual_plot)
+
+```
+
+No outliers. 
+
+##### Bullying 
+
+```{r bully ple_be_pi bivariate, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% select(id_num, bully_score, ple_be_pi) %>% distinct(id_num,.keep_all = TRUE)
+
+bagplot(cbind(df2$buly_score,df2$ple_be_pi))
+
+individual_plot <- ggplot(data = df2, aes(bully_score, ple_be_pi)) +geom_smooth(method = 'lm') + geom_point()
+
+print(individual_plot)
+
+```
+
+No outliers.
+
+## Switching Model
+
+### Assumption: Absence of Multicolinearity
+
+```{r multicolinearlity, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% distinct(id_num, .keep_all = TRUE)
+
+## Check correlation of variables
+cor(df2[,c(62,67,70,79,80)], use="complete.obs") # No high correlations
+
+```
+
+
+### Determining Distribution Fit
+```{r distributions, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% 
+  distinct(id, .keep_all = TRUE)
+
+## Temp load package
+library(fitdistrplus)
+
+
+## Show empirical density and cumulative distribution
+plotdist(df2$local_global_cost_index, histo = TRUE, demp = TRUE)
+plotdist(df2$global_local_cost_index, histo = TRUE, demp = TRUE)
+
+## Skewness-kurtosis plot 
+descdist(df2$local_global_cost_index, boot = 1000, discrete = FALSE)
+descdist(df2$global_local_cost_index, boot = 1000, discrete = FALSE)
+
+### Transform to positive values to determine best fit
+## adding 1000 to each score
+add <- function(x){
+  #add to reflect
+  1000 + x
+}
+
+df2$local_global_cost_index <- sapply(df2$local_global_cost_index, add)
+df2$global_local_cost_index <- sapply(df2$global_local_cost_index, add)
+
+
+
+## Fit distributions
+
+fit_norm <- fitdist(df2$local_global_cost_index, "norm")
+plot(fit_norm)
+
+fit_lnorm <- fitdist(df2$local_global_cost_index, "lnorm")
+plot(fit_lnorm)
+
+fit_gamma <- fitdist(df2$local_global_cost_index, "gamma")
+plot(fit_gamma)
+
+fit_logis <- fitdist(df2$local_global_cost_index, "logis")
+plot(fit_logis) # Appears to follow logistic distribution well
+
+
+fit_norm1 <- fitdist(df2$global_local_cost_index, "norm")
+plot(fit_norm1)
+
+fit_lnorm1 <- fitdist(df2$global_local_cost_index, "lnorm")
+plot(fit_lnorm1)
+
+fit_gamma1 <- fitdist(df2$global_local_cost_index, "gamma")
+plot(fit_gamma1)
+
+fit_logis1 <- fitdist(df2$global_local_cost_index, "logis")
+plot(fit_logis1) # Appears to follow logistic distribution well
+
+
+
+
+## Look at AIC's
+fit_norm$aic
+fit_lnorm$aic
+fit_gamma$aic
+fit_logis$aic # Best fit
+
+
+fit_norm1$aic 
+fit_lnorm1$aic
+fit_gamma1$aic
+fit_logis1$aic # Best fit
+
+detach(package:fitdistrplus)
+
+
+```
+
+Lognormal best fit for analysis.
+
+#### Local to Global Model 
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Select variables 
+df2 <- df2 %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+  select(id, id_num, local_global_cost_index, global_local_cost_index, pa_scale, as_index, ple_be_pi, be_scale, pi_scale, AGE)
+
+
+## Log Transformed
+lmod_locswitch_log <- lm(log(local_global_cost_index) ~  as_index + pa_scale, data = df2)
+summary(lmod_locswitch_log) 
+
+## Normal
+lmod_locswitch <- lm(local_global_cost_index ~  pa_scale + as_index, data = df2)
+summary(lmod_locswitch) 
+
+
+```
+
+
+
+#### Homoscadasticity of Residuals
+```{r glm residual normality, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+
+
+## Checking homoscadescity of residual
+residualPlot(lmod_locswitch, type = 'rstudent')
+
+bptest(lmod_locswitch) #  sig different to heteroscatic variance (not homoscadestic)
+
+
+```
+#### Global to Local Model Comparisons
+##### Normal distrbution 
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+
+
+lmod_gloswitch <- lm(global_local_cost_index ~  as_index + pa_scale, data = df2)
+summary(lmod_gloswitch)
+
+
+## Checking homoscadescity of residual
+residualPlot(lmod_gloswitch, type = 'rstudent')
+
+bptest(lmod_gloswitch) #  sig different to heteroscatic variance (not homoscadestic)
+
+
+
+
+```
+
+
+##### linear model
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+lm_gloswitch <- lm(global_local_cost_index ~ as_index, data = df2) 
+summary(lm_gloswitch) # Not significant rs = 0.004
+
+lm_gloswitch1 <- lm(global_local_cost_index ~  ple_be_pi + as_index, data = df2)
+summary(lm_gloswitch1) ## slightly improves fit to 0.005
+
+lm_gloswitch2 <- lm(global_local_cost_index ~  ple_be_pi + as_index + pa_scale, data = df2)
+summary(lm_gloswitch2) ## reduces rs = 0.0016
+
+lm_gloswitch3 <- lm(global_local_cost_index ~  as_index + pa_scale, data = df2)
+summary(lm_gloswitch3) ## without ple_be_pi rs = 0.003
+
+lm_gloswitch4 <- lm(global_local_cost_index ~  as_index*pa_scale + ple_be_pi, data = df2)
+summary(lm_gloswitch4) ## Moderating effect shows positive relationship
+
+
+```
+
+
+#### Normality of Residuals and Homoscadasticity 
+```{r glm residual normality, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+## Check normality of residuals
+plot(density(resid(lm_gloswitch2)))
+
+hist(resid(lm_gloswitch2)) 
+
+qqPlot(resid(lm_gloswitch2))
+
+shapiro.test(resid(lm_gloswitch2)) 
+
+## Check fit of model
+plot(fitted(lm_gloswitch2),df2$global_local_cost_index,)
+abline(a = 0, b = 1)
+
+
+## Checking homoscadescity of residual
+residualPlot(lm_gloswitch2, type = c('deviance'))
+
+bptest(lm_gloswitch2) #  sig different to heteroscatic variance (not homoscadestic)
+
+
+
+library(gamlss)
+## See summary of model fit
+plot(lm_gloswitch2)
+
+## Check Worm Plot
+wp(lm_gloswitch2, ylim.all = 1, xlim.all = 3) # Lower value looks like outlier
+
+
+detach(package:gamlss)
+
+```
+
+## Bullying Model
+
+### Multicolinearlity 
+
+
+### Determining Distribution Fit
+```{r distributions, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% 
+  distinct(id, .keep_all = TRUE)
+
+## Temp load package
+library(fitdistrplus)
+
+
+## Show empirical density and cumulative distribution
+plotdist(df2$bully_score, histo = TRUE, demp = TRUE)
+
+
+## Skewness-kurtosis plot 
+descdist(df2$bully_score, boot = 1000, discrete = FALSE)
+
+
+## Fit distribution
+
+fit_norm <- fitdist(df2$bully_score, "norm")
+plot(fit_norm)
+
+fit_exp <- fitdist(df2$bully_score, "exp")
+plot(fit_exp)
+
+
+## Look at AIC's
+fit_norm$aic
+fit_exp$aic
+
+detach(package:fitdistrplus)
+
+
+df2 <-df %>% distinct(id, .keep_all = TRUE)
+df2$AGE <- as.numeric(df2$AGE)
+summary(df2)
+sd(df2$AGE)
+
+
+```
+
+
+### Model Comparison
+##### Exponential Distrbution GLM
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+## Select variables 
+df2 <- df2 %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+  select(id, id_num, local_global_cost_index, global_local_cost_index, pa_scale, as_index, ple_be_pi, be_scale, pi_scale, AGE, bully_score)
+
+
+### Transform to positive values to determine best fit
+## adding 1 to each score
+add <- function(x){
+  #add to reflect
+  1 + x
+}
+
+df2$bully_score <- sapply(df2$bully_score, add)
+
+lmod_bully3 <- lm(log(bully_score) ~  as_index + pa_scale,  data = df2)
+summary(lmod_bully3)
+
+
+
+## Load package
+library(gamlss)
+
+
+lmod_bully3 <- gamlss(bully_score ~  as_index + pa_scale, family = EXP(mu.link = "identity"),  data = df2)
+summary(lmod_bully3) ## Both as and pa significant together AIC = 1710
+
+
+
+Rsq(lmod_bully3, type = c("both"))
+
+detach(package:gamlss)
+
+confint(lmod_bully3)
+
+
+```
+
+##### Normality and Homoscadasticity of Residuals
+
+
+
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+## Check normality of residuals
+plot(density(resid(lmod_bully3)))
+
+hist(resid(lmod_bully3)) 
+
+qqPlot(resid(lmod_bully3))
+
+shapiro.test(resid(lmod_bully3)) 
+
+## Check fit of model
+plot(fitted(lmod_bully3),df2$bully_score,)
+abline(a = 0, b = 1)
+
+
+## Checking homoscadescity of residual
+residualPlot(lmod_bully3, type = c('weighted'))
+
+bptest(lmod_bully3) #  sig different to heteroscatic variance (not homoscadestic)
+
+
+
+library(gamlss)
+## See summary of model fit
+plot(lmod_bully3)
+
+## Check Worm Plot
+wp(lmod_bully3, ylim.all = 1, xlim.all = 3) # Lower value looks like outlier
+
+## Check term plot
+term.plot(lmod_bully3)
+
+detach(package:gamlss)
+
+```
+
+
+## Bizzare Exerpiences and Persecutary Ideation Model
+
+### Multicolinearity
+
+### Determining Distribution Fit
+```{r distributions, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% 
+  distinct(id, .keep_all = TRUE)
+
+### Transform to positive values to determine best fit
+## adding 1 to each score
+add <- function(x){
+  #add to reflect
+  1 + x
+}
+
+
+
+df2$ple_be_pi <- sapply(df2$ple_be_pi, add)
+
+
+## Temp load package
+library(fitdistrplus)
+
+
+## Show empirical density and cumulative distribution
+plotdist(df2$ple_be_pi, histo = TRUE, demp = TRUE)
+
+## Skewness-kurtosis plot 
+descdist(df2$ple_be_pi, boot = 1000, discrete = FALSE)
+
+
+
+## Fit distribution
+
+fit_norm <- fitdist(df2$ple_be_pi, "norm")
+plot(fit_norm)
+
+fit_lnorm <- fitdist(df2$ple_be_pi, "lnorm")
+plot(fit_lnorm)
+
+fit_gamma <- fitdist(df2$ple_be_pi, "gamma")
+plot(fit_gamma)
+
+fit_logis <- fitdist(df2$ple_be_pi, "logis")
+plot(fit_logis)
+
+fit_weibull <- fitdist(df2$ple_be_pi, "weibull")
+plot(fit_weibull)
+
+
+## Look at AIC's
+fit_norm$aic
+fit_lnorm$aic
+fit_gamma$aic
+fit_logis$aic
+fit_weibull$aic
+
+detach(package:fitdistrplus)
+
+
+```
+Although states log norm is best fit QQ plot appears otherwise. Gamma looks more appears a better choice.
+
+### Model Comparison
+##### Gamma Distrbution GLM
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+## Select variables 
+df2 <- df2 %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+  select(id, id_num, local_global_cost_index, global_local_cost_index, pa_scale, as_index, ple_be_pi, be_scale, pi_scale, AGE, bully_score)
+
+
+
+lmod_ple2 <- lm(log(ple_be_pi) ~  as_index + pa_scale , data = df2)
+summary(lmod_ple2)
+
+
+
+residualPlot(lmod_ple2, type = "deviance")
+
+bptest(lmod_ple2) 
+
+
+
+## Load package
+library(gamlss)
+
+
+
+
+
+
+## Building Models
+lmod_ple <- gamlss(ple_be_pi ~  as_index , family = GA, data = df2)
+summary(lmod_ple) ## Significant (0.002) AIC = 1707 SBC = 1723
+
+lmod_ple2 <- gamlss(ple_be_pi ~  as_index + pa_scale , family = GA, data = df2)
+summary(lmod_ple2) ## Both predict independently AIC = 1700
+
+lmod_ple3 <- gamlss(ple_be_pi ~  as_index + pa_scale + bully_score , family = GA, data = df2)
+summary(lmod_ple3) ## Bully score removes other significance AIC = 1300
+
+lmod_ple4 <- gamlss(ple_be_pi ~  as_index + bully_score , family = GA, data = df2)
+summary(lmod_ple4) ## Accounts for bullying even alone AIC 1298
+
+lmod_ple5 <- gamlss(ple_be_pi ~  as_index*bully_score + pa_scale , family = GA, data = df2)
+summary(lmod_ple5) ## 1277 AIC
+
+lmod_ple6 <- gamlss(ple_be_pi ~  as_index*bully_score, family = GA, data = df2)
+summary(lmod_ple6) ## 1275
+
+```
+
+
+
+##### Lognorm GLM
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+lmod_ple <- gamlss(ple_be_pi ~  as_index , family = LOGNO, data = df2)
+summary(lmod_ple) ## Significant (0.002) AIC = 1707 SBC = 1723
+
+lmod_ple2 <- gamlss(ple_be_pi ~  as_index + pa_scale , family = LOGNO, data = df2)
+summary(lmod_ple2) ## Both predict independently AIC = 1700
+
+lmod_ple3 <- gamlss(ple_be_pi ~  as_index + pa_scale + bully_score , family = LOGNO, data = df2)
+summary(lmod_ple3) ## Bully score removes other significance AIC = 1300
+
+lmod_ple4 <- gamlss(ple_be_pi ~  as_index + bully_score , family = LOGNO, data = df2)
+summary(lmod_ple4) ## Accounts for bullying even alone AIC 1298
+
+lmod_ple5 <- gamlss(ple_be_pi ~  as_index*bully_score + pa_scale , family = LOGNO, data = df2)
+summary(lmod_ple5) ## 1277 AIC
+
+lmod_ple6 <- gamlss(ple_be_pi ~  as_index*bully_score, family = LOGNO, data = df2)
+summary(lmod_ple6) ## 1275
+
+
+detach(package:gamlss)
+
+
+```
+
+Get similar results with log normal transformation anyway. 
+
+##### Normality and Homoscadasticity of Residuals
+
+
+
+
+
+
+
+
+## SEM
+
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+df2 <- df %>% 
+  distinct(id, .keep_all = TRUE) 
+
+summary(df2[, c('be_scale', 'pi_scale', 'cbv_score', 'tbv_score', 'communication', 'social_skills', 'attention_switching', 'pa_scale')])
+
+library(MVN)
+test <- mvn(df2[, c('be_scale', 'pi_scale', 'cbv_score', 'tbv_score', 'communication', 'social_skills', 'attention_switching', 'pa_scale')], mvnTest = 'royston')
+
+test$multivariateNormality # Not multivariate normality
+
+## Main analysis check
+
+lmod_sem <- lm(log(ple_be_pi) ~  as_index + pa_scale + bully_score , data = df2)
+summary(lmod_sem)
+
+bptest(lmod_sem) 
+
+lmod_sem2 <- lm(log(bully_score) ~  as_index + pa_scale,  data = df2)
+summary(lmod_sem2)
+bptest(lmod_sem2) 
+
+
+## Change labels for visualisation 
+colnames(df2)[70] <- "BE"
+colnames(df2)[69] <- "PI"
+colnames(df2)[71] <- "PA"
+colnames(df2)[73] <- "TBV"
+colnames(df2)[74] <- "CBV"
+colnames(df2)[66] <- "C"
+colnames(df2)[65] <- "AS"
+colnames(df2)[64] <- "SS"
+
+library(lavaan)
+
+
+
+sem <- '
+## CFA model
+DLE =~ NA*BE + PI
+BV =~ NA*TBV + CBV
+AT =~ NA*C + SS + AS
+DLE ~~ 1*DLE
+AT ~~ 1*AT
+BV ~~ 1*BV
+
+## Path model
+DLE ~ b*BV + c*AT + d*PA 
+BV ~ a*AT + e*PA
+
+dir1 := c
+ind1 := a*b
+dir2 := d
+ind2 := e*b
+dir3 := b
+total := dir1 + ind1 + dir2 + ind2 + dir3
+
+'
+fit <- sem(sem, data = df2, se = 'robust.sem', test = 'satorra.bentler')
+summary(fit, fit.measures = TRUE, standardized=TRUE)
+
+
+df3 <- df2 %>% filter(GND != "Non-binary / third gender")
+
+fit_con <- sem(sem, data = df3, group = "GND",  se = 'robust.sem', test = 'satorra.bentler')
+summary(fit_con, fit.measures = TRUE, standardized=TRUE)
+
+fit_met <- sem(sem, data = df3, group = "GND",  group.equal = 'loadings',se = 'robust.sem', test = 'satorra.bentler')
+summary(fit_met, fit.measures = TRUE, standardized=TRUE)
+
+library(semTools)
+
+summary(compareFit(fit_con, fit_met))
+
+boot <- parameterestimates(fit, level = 0.95, boot.ci.type ='bca.simple', standardized = T)
+
+print(boot)
+
+summary(boot)
+boot2 <-bootstrapLavaan(fit, R=1000)
+summary(boot)
+
+
+
+library(semTools)
+
+summary(compareFit(fit, fit2))
+
+
+modindices(fit)
+detach(package:lavaan)
+
+
+
+```
+
+
+## Visualisation 
+
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+library(lavaan)
+library(tidySEM)
+library(dplyr)
+
+get_nodes(fit)
+
+lay <- get_layout("","","pa_scale","","","","","", 
+                  "","","","","bully","","ple", "", 
+                  "","", "at","", "", "","", "",
+                  "social_skills","communication","attention_switching", "","tbv_score","cbv_score","be_scale","pi_scale", rows = 4)
+
+graph_sem(fit, layout = lay)
+
+```
+
+
+
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+library(lavaan)
+library(semPlot)
+library(gplots)
+
+
+
+
+pathdiagram = semPaths(fit, layout = "tree",what="std",sizeLat=10, 
+                       sizeLat2=10,sizeMan=6, sizeMan2=6,fade= F,
+                       edge.color = "#000000", 
+                       edge.label.cex=1.2, edge.label.position=.5,
+                       asize=3,rotation=3,mar=c(6,6,6,12), 
+                       whatLabels = "est", optimizeLatRes = T, esize = 10,
+                       levels = c(1.5,3,4.5,5.9))
+
+edgelabels = pathdiagram$graphAttributes$Edges$labels  #this and the next few lines remove leading zeros from factor loading coefficients for easier reading
+edgelabels[which(pathdiagram$graphAttributes$Edges$curve == 0)] = gsub("0[.]", ".", edgelabels[which(pathdiagram$graphAttributes$Edges$curve == 0)])
+pathdiagram$graphAttributes$Edges$labels = edgelabels
+
+
+
+
+# we will also make the structural relationships in the mediation model heavier (thicker lines) so that part is easier to see
+latentnodes = which(pathdiagram$Arguments$shape == "circle")  # identify which nodes correspond with latent variables
+latentedges = which((pathdiagram$Edgelist$from %in% latentnodes) & (pathdiagram$Edgelist$to %in% latentnodes))  # identify which nodes are connecting latent variables
+pathdiagram$graphAttributes$Edges$width[latentedges] = 5
+pathdiagram$graphAttributes$Edges$label.font[latentedges] = 2
+pathdiagram$graphAttributes$Edges$fade[latentedges] = 10
+
+# we will also make the structural relationships in the mediation model heavier (thicker lines) so that part is easier to see
+panode = which(pathdiagram$Arguments$labels == "PA")  # identify which nodes correspond with latent variables 
+paedge = which(pathdiagram$Edgelist$from %in% panode)  # identify which nodes are connecting latent variables
+pathdiagram$graphAttributes$Edges$width[paedge] = 5
+pathdiagram$graphAttributes$Edges$label.font[paedge] = 2
+pathdiagram$graphAttributes$Edges$fade[paedge] = 10
+pathdiagram$graphAttributes$Nodes$width[panode] = 10
+pathdiagram$graphAttributes$Nodes$height[panode] = 10
+
+latent1 <- which(pathdiagram$Arguments$labels == c("BE","PI"))
+latent1edge = which(pathdiagram$Edgelist$to %in% latent1)
+pathdiagram$graphAttributes$Edges$color[latent1edge] = "#2B728A"
+
+latent5 <- which(pathdiagram$Arguments$labels == "CBV")
+latent5edge = which(pathdiagram$Edgelist$to %in% latent5)
+pathdiagram$graphAttributes$Edges$color[latent5edge] = "#04347D"
+
+latent6 <- which(pathdiagram$Arguments$labels == "TBV")
+latent6edge = which(pathdiagram$Edgelist$to %in% latent6)
+pathdiagram$graphAttributes$Edges$color[latent6edge] = "#04347D"
+
+latent3 <- which(pathdiagram$Arguments$labels == c( "AS", "C", "SS"))
+latent3edge = which(pathdiagram$Edgelist$to %in% latent3)
+pathdiagram$graphAttributes$Edges$color[latent3edge] = "#46085E"
+
+
+
+# add fit statistics to the path diagram image
+fitstats = fitMeasures(fit, c("chisq.scaled","df","pvalue.scaled","cfi.robust","tli.robust","rmsea.robust"))
+
+
+plot(pathdiagram)
+
+text("(a)", x=-0.25, y= -.05, font=3, srt=0, cex=0.9, adj=0.5)
+text("(c)", x=0.25, y= -.05, font=3, srt=0, cex=0.9, adj=0.5)
+text("(b)", x= 0, y= .45, font=3, srt=0, cex=0.9, adj=0.5)
+text("(e)", x= -0.25, y= .73, font=3, srt=0, cex=0.9, adj=0.5)
+text("(d)", x= 0.25, y= .73, font=3, srt=0, cex=0.9, adj=0.5)
+
+text("***", x= 0.06, y= .36, font=3, srt=0, cex=0.9, adj=0.5)
+text("***",x= 0.24, y= .68, font=3, srt=0, cex=0.9, adj=0.5)
+text("**", x= -0.12, y= .01, font=3, srt=0, cex=0.9, adj=0.5)
+text("**",x= -0.13, y= .68, font=3, srt=0, cex=0.9, adj=0.5)
+
+fitstring1 = paste0("Fit Indices:")
+fitstring2 = paste0("χ²(",fitstats["df"],") = ",sprintf("%.2f",fitstats["chisq.scaled"]))
+fitstring3 = paste0("p = ",sprintf("%.2f",fitstats["pvalue.scaled"]))
+fitstring4 = paste0("Robust CFI = ", sprintf("%.2f",fitstats["cfi.robust"]))
+fitstring5 = paste0("Robust TLI = ",sprintf("%.2f",fitstats["tli.robust"]))
+fitstring6 = paste0("Robust RMSEA = ",sprintf("%.2f",fitstats["rmsea.robust"]))
+fitstring7 = paste0("")
+fitstring8 = paste0("Specific Indirect Effects:")
+fitstring9 = paste0("a*b =  0.0807*")
+fitstring10 = paste0("[CI = 0.0072, 0.1541] (5.8%)")
+fitstring11 = paste0("e*b =  0.1412*")
+fitstring12 = paste0("[CI = 0.0072, 0.1541] (9.1%)")
+fitstringfull = paste(fitstring1, fitstring2, fitstring3, fitstring4, fitstring5,fitstring6, fitstring7,fitstring8, fitstring9,fitstring10, fitstring11, fitstring12,sep="\n")
+text(2, 0.7, fitstringfull, adj=c(1,1), family="optima", cex=1.2, xpd=NA)
+
+dev.copy(png,'mediation.png', res=2000, width=300, height=200, unit="mm")
+dev.off()
+
+```
+Line thickness weighted for standardised parameter estimates (not for structural model but for measurement model)
+
+
+## Scatterplots with latent variable estimates
+
+```{r comparisons, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+
+## Extract coefecients from SEM
+a = coef(fit)["a"]
+b = coef(fit)["b"]
+c = coef(fit)["c"]
+d = coef(fit)["d"]
+e = coef(fit)["e"]
+ab = a*b
+eb = e*b
+
+ 
+
+
+## Construct SEM without mediation to get total effect
+
+sem2 <- '
+## CFA model
+DLE =~ NA*BE + PI
+BV =~ NA*TBV + CBV
+AT =~ NA*C + SS + AS
+DLE ~~ 1*DLE
+AT ~~ 1*AT
+BV ~~ 1*BV
+
+## Path model
+DLE ~ c*AT 
+
+'
+fittotal <- sem(sem2, data = df2, se = 'robust.sem', test = 'satorra.bentler',std.lv=T )
+summary(fittotal, fit.measures = TRUE, standardized=TRUE)
+
+ctotal = coef(fittotal)["c"]
+
+
+sem3 <- '
+## CFA model
+DLE =~ NA*BE + PI
+BV =~ NA*TBV + CBV
+AT =~ NA*C + SS + AS
+DLE ~~ 1*DLE
+AT ~~ 1*AT
+BV ~~ 1*BV
+
+## Path model
+DLE ~ d*PA
+
+'
+fittotal2 <- sem(sem3, data = df2, se = 'robust.sem', test = 'satorra.bentler',std.lv=T )
+summary(fittotal2, fit.measures = TRUE, standardized=TRUE)
+dtotal = coef(fittotal2)["d"]
+
+
+
+test1 = coef(fittotal2)["d"] # BV - increases from  .783 to 0.861
+
+test2 = coef(fittotal2)["d"] # AT - increases from .783 to 0.815
+
+test3 = coef(fittotal2)["d"] # AT + BV - increases from .783 to 0.867
+
+## Use CFA to obtain latent estimates
+
+
+cfa <- '
+## CFA model
+DLE =~ NA*BE + PI
+BV =~ NA*TBV + CBV
+AT =~ NA*C + SS + AS
+DLE ~~ 1*DLE
+AT ~~ 1*AT
+BV ~~ 1*BV
+
+'
+fitcfa <- cfa(cfa, data=df2, std.lv=T)
+latent_estimates <- data.frame(lavPredict(fitcfa))
+
+# Plot 1 AT and BV (path a)
+png(paste0("Mediation_raw_path_a.png"), width=75, height=75, unit="mm", res=1000, pointsize=8)   
+plot(y=latent_estimates$BV, x=latent_estimates$AT, ylab="Latent Bullying-Victimisation (M) Estimate", xlab="Latent Autistic Traits (X) Estimate", main="Autistic traits to Bullying-Victimiation (Path a)", pch=16, ps=1.25, cex.lab=1, cex.axis=1, cex.main=1)
+abline(a=0, b= a)   # draw regression line
+text(2.9, 2.5, "a", font=3, cex=1.25)   # add "a" symbol clarifying what the regression line is
+dev.off()
+
+
+# Plot 2 BV and DLE (path b)
+png(paste0("Mediation_raw_path_b.png"), width=75, height=75, unit="mm", res=1000, pointsize=8)   
+plot(y=latent_estimates$DLE, x=latent_estimates$BV, ylab="Latent Delusional-Like Experiences (Y) Estimate", xlab="Latent Bullying-Victimisation (M) Estimate", main="Bullying-Victimisation to Delusional-Like Experiences (path b)", pch=16, ps=1.25, cex.lab=1, cex.axis=1, cex.main=1)
+abline(a=0, b= b)  
+text(2.9, 1.1, "b", font=3, cex=1.25)
+dev.off()
+
+# plot 3 AT and DLE (path c)
+png(paste0("Mediation_raw_path_c.png"), width=75, height=75, unit="mm", res=1000, pointsize=8)   
+plot(y=latent_estimates$DLE, x=latent_estimates$AT, ylab="Delusional-Like Experiences (Y) Estimate", xlab="Autistic Traits (X) Estimate", main="Autistic Traits to Delusional-Like Experiences (path c)", pch=16, ps=1.25, cex.lab=1, cex.axis=1, cex.main=1)
+abline(a=0, b= ctotal, lty=2)   # plot c (total effect) regression line
+abline(a=0, b= c, lty=1)   # plot c' (direct effect) regression line
+text(2.9, 2.7, "c", font=3, cex=3)
+text(2.9, 1.4, "c'", font=3, cex=3)
+#legend("topleft", lty=c(1,2), legend=c("c (total effect)", "c' (direct effect)"), bty="n")
+dev.off()
+
+# plot 4 PA to BV (path e)
+png(paste0("Mediation_raw_path_e.png"), width=75, height=75, unit="mm", res=1000, pointsize=8)   
+plot(y=latent_estimates$BV, x= df2$PA, ylab="Latent Bullying-Victimisation (M) Estimate", xlab="Perceptual Abnormalities Score", main="Perceptual Abnormalities to Bullying-Victimiation (Path e)", pch=16, ps=1.25, cex.lab=1, cex.axis=1, cex.main=1)
+abline(a=0, b= e)   # draw regression line
+text(2.9, 2.5, "e", font=3, cex=1.25)   # add "a" symbol clarifying what the regression line is
+dev.off()
+
+
+# Plot 5 PA and DLE (path d)
+png(paste0("Mediation_raw_path_d.png"), width=75, height=75, unit="mm", res=1000, pointsize=8)   
+plot(y=latent_estimates$DLE, x=df2$PA, ylab="Delusional-Like Experiences (Y) Estimate", xlab="Perceptual Abnormalities Score", main="Perceptual Abnormalities to Delusional-Like Experiences (path d)", pch=16, ps=1.25, cex.lab=1, cex.axis=1, cex.main=1)
+abline(a=0, b= dtotal, lty=2)   # plot c (total effect) regression line
+abline(a=0, b= d, lty=1)   # plot c' (direct effect) regression line
+text(2.9, 2.7, "d", font=3, cex=3)
+text(2.9, 1.4, "d'", font=3, cex=3)
+#legend("topleft", lty=c(1,2), legend=c("c (total effect)", "c' (direct effect)"), bty="n")
+dev.off()
+
+detach(package:lavaan)
+```
+Bully-victimization increased the predictive power of delusional-like experiences, increasing its parameter estimates. Suppressor.
+## Check suppresson
+```{r cronbach dataframes, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+check <- lm(ple_score ~ PA,  data = df2)
+summary(check)
+
+check2 <- lm(ple_score ~ PA + bully_score, data =  df2)
+summary(check2)
+
+check3 <- lm(ple_score ~ PA + as_index, data =  df2)
+summary(check3)
+
+check4 <- lm(ple_score ~ PA + as_index + bully_score, data =  df2)
+summary(check4)
+
+
+cor <- data.frame(latent_estimates$DLE, latent_estimates$BV,latent_estimates$AT,df2$PA)
+cor(cor, method = "pearson")
+
+library(ppcor)
+pcor(cor)
+
+## Partial correlation is lower than zero-order correlation indicating no suppression effects. May be due to facillitation rather than suppression.(not just picking up errors)
+
+```
+
+
+
+
+
+
+## Cronbach's Alpha Calculations
+
+### Create Unique Dataframes
+
+```{r cronbach dataframes, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Parse one score per ppt
+ca <- df %>% 
+  group_by(id) %>%
+  distinct(id, .keep_all = TRUE) # unique score per ppts
+```
+
+#### Austic Traits Dataframe
+```{r as dataframes, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Social skills scale 
+
+trait_1 <- ca$TRAIT_1 #create variables to remove id
+trait_4 <- ca$TRAIT_4
+trait_7 <- ca$TRAIT_7
+trait_9 <- ca$TRAIT_9
+trait_11<- ca$TRAIT_11
+
+ca_social_skills <- data.frame(trait_1, trait_4, trait_7,
+                               trait_9, trait_11) # create new dataframe
+
+## Attention switching scale
+
+trait_2 <- ca$TRAIT_2
+trait_5 <- ca$TRAIT_5
+trait_10 <- ca$TRAIT_10
+trait_12 <- ca$TRAIT_12
+
+
+ca_attention_switching <- data.frame(trait_2, trait_5, trait_10, trait_12)
+
+## Communication scale
+trait_3 <- ca$TRAIT_3
+trait_6 <- ca$TRAIT_6
+trait_8 <- ca$TRAIT_8
+
+ca_communication <- data.frame(trait_3, trait_6, trait_8)
+
+## Total survey
+ca_as_total <- data.frame(trait_3, trait_6, trait_8,trait_2,
+                          trait_5,trait_10, trait_12, trait_1,
+                          trait_4, trait_7, trait_9, trait_11)
+```
+
+#### Psychotic_like Experiences Dataframes
+
+```{r ple dataframes, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Persecutary ideation scale
+
+ple_1 <- ca$PLE_1
+ple_3 <- ca$PLE_3
+ple_4 <- ca$PLE_4
+ple_5 <- ca$PLE_5
+ple_6 <- ca$PLE_6
+
+ca_pers_idea <- data.frame(ple_1, ple_3, ple_4, ple_5, ple_6)
+
+
+## Bizzare experiences scale
+
+ple_2 <- ca$PLE_2
+ple_7 <- ca$PLE_7
+ple_9 <- ca$PLE_9
+ple_11 <- ca$PLE_11
+ple_12 <- ca$PLE_12
+ple_13 <- ca$PLE_13
+ple_15 <- ca$PLE_15
+
+ca_bizz_exp <- data.frame(ple_2, ple_7,ple_9,ple_11,
+                          ple_12, ple_13, ple_15)
+
+## Perceptual abnormalities scale
+
+ple_8 <- ca$PLE_8
+ple_10 <- ca$PLE_10
+ple_14 <- ca$PLE_14
+
+ca_perc_abn <- data.frame(ple_8, ple_10, ple_14)
+
+## Total survey 
+
+ca_ple_total <- data.frame(ple_2, ple_7,ple_9,ple_11, ple_12,
+                           ple_13, ple_15, ple_8, ple_10, ple_14,
+                           ple_1, ple_3, ple_4, ple_5, ple_6)
+
+## Total without perceptual abnormalities scale
+
+ca_ple_be_pi <- data.frame(ple_2, ple_7,ple_9,ple_11, ple_12,
+                           ple_13, ple_15, ple_1, ple_3, ple_4, 
+                           ple_5, ple_6)
+
+```
+
+#### Bullying Dataframes
+
+```{r bully dataframes, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Total traditional victimisation bullying survey
+
+tbv_1 <- ca$TBV.1_1
+tbv_2 <- ca$TBV.1_2
+tbv_3 <- ca$TBV.1_3
+tbv_4 <- ca$TBV.1_4
+tbv_5 <- ca$TBV.1_5
+tbv_6 <- ca$TBV.1_6
+tbv_7 <- ca$TBV.1_7
+tbv_8 <- ca$TBV.1_8
+
+ca_tbv_total <- data.frame(tbv_1, tbv_2,tbv_3, tbv_4, tbv_5, 
+                           tbv_6, tbv_7, tbv_8)
+
+## Total Cyber bullying victimisation survey
+
+cbv_1 <- ca$CBV.1_1
+cbv_2 <- ca$CBV.1_2
+cbv_3 <- ca$CBV.1_3
+cbv_4 <- ca$CBV.1_4
+cbv_5 <- ca$CBV.1_5
+cbv_6 <- ca$CBV.1_6
+cbv_7 <- ca$CBV.1_7
+cbv_8 <- ca$CBV.1_8
+cbv_9 <- ca$CBV.1_9
+cbv_10 <- ca$CBV.1_10
+cbv_11 <- ca$CBV.1_11
+
+ca_cbv_total <- data.frame(cbv_1, cbv_2,cbv_3, cbv_4, cbv_5, 
+                           cbv_6, cbv_7, cbv_8, cbv_9, cbv_10,
+                           cbv_11)
+
+## Overall bullying
+
+ca_bully_total <- data.frame(cbv_1, cbv_2,cbv_3, cbv_4, cbv_5, 
+                             cbv_6, cbv_7, cbv_8, cbv_9, cbv_10,
+                             cbv_11, tbv_1, tbv_2,tbv_3, tbv_4, 
+                             tbv_5, tbv_6, tbv_7, tbv_8)
+```
+
+#### Performing Cronbach's Alpha
+```{r ca test, warning = FALSE, echo = FALSE, message=FALSE, results= 'hide'}
+
+## Temparily load package
+
+library(ltm)
+
+
+## Test autistic survey measures
+
+cronbach.alpha(ca_social_skills, CI = TRUE,
+               na.rm = TRUE) # Alpha .813 CI[0.768, 0.849]
+
+cronbach.alpha(ca_attention_switching, CI = TRUE, 
+               na.rm = TRUE) # Alpha 0.51 [0.397, 0.603]     
+
+cronbach.alpha(ca_communication, CI = TRUE,
+               na.rm = TRUE) # Alpha 0.791 [0.740, 0.837]
+
+cronbach.alpha(ca_as_total, CI = TRUE,
+               na.rm = TRUE) # Alpha 0.868 [0.843, 0.887]
+
+## Test psychotic-like experience survey measures
+
+cronbach.alpha(ca_pers_idea, CI = TRUE, 
+               na.rm = TRUE) # Alpha 0.724 [0.648, 0.777] 
+
+cronbach.alpha(ca_bizz_exp, CI = TRUE,
+               na.rm = TRUE) # Alpha 0.693 [0.615, 0.751] 
+
+cronbach.alpha(ca_perc_abn, CI = TRUE, 
+               na.rm = TRUE) # Alpha 0.64 [0.512, 0.738]
+
+cronbach.alpha(ca_ple_total, CI = TRUE, 
+               na.rm = TRUE) # Alpha 0.822 [0.779, 0.854]
+
+cronbach.alpha(ca_ple_be_pi, CI = TRUE,
+               na.rm = TRUE) #Alpha 0.799 [0.757, 0.831]
+
+## Test traditional and cyberbullyubg victimisation measures
+
+cronbach.alpha(ca_tbv_total, CI = TRUE,
+               na.rm = TRUE) #Alpha 0.872 [0.843, 0.895]
+
+cronbach.alpha(ca_cbv_total, CI = TRUE,
+               na.rm = TRUE) #Alpha 0.861 [0.799, 0.895]
+
+cronbach.alpha(ca_bully_total, CI = TRUE,
+               na.rm = TRUE) #Alpha 0.892 [0.865, 0.911]
+
+## Remove package
+detach(package:ltm)
+
+```
